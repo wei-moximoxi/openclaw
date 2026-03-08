@@ -64,6 +64,10 @@ import {
   validateGeminiTurns,
 } from "../../pi-embedded-helpers.js";
 import { subscribeEmbeddedPiSession } from "../../pi-embedded-subscribe.js";
+import {
+  containsKimiCodingXmlToolCalls,
+  parseKimiCodingXmlToolCalls,
+} from "../../pi-embedded-utils.js";
 import { createPreparedEmbeddedPiSettingsManager } from "../../pi-project-settings.js";
 import { applyPiAutoCompactionGuard } from "../../pi-settings.js";
 import { toClientToolDefinitions } from "../../pi-tool-definition-adapter.js";
@@ -534,6 +538,161 @@ function wrapStreamFnDecodeXaiToolCallArguments(baseFn: StreamFn): StreamFn {
       );
     }
     return wrapStreamDecodeXaiToolCallArguments(maybeStream);
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Kimi Coding: parse XML tool calls into structured tool calls
+// ---------------------------------------------------------------------------
+
+function isKimiCodingModel(model: { provider?: string; baseUrl?: string }): boolean {
+  if (typeof model.provider === "string" && model.provider.trim().toLowerCase() === "kimi-coding") {
+    return true;
+  }
+  if (typeof model.baseUrl === "string") {
+    const normalized = model.baseUrl.toLowerCase();
+    return normalized.includes("kimi.com") && normalized.includes("/coding");
+  }
+  return false;
+}
+
+function wrapStreamParseKimiCodingXmlTools(
+  stream: ReturnType<typeof streamSimple>,
+): ReturnType<typeof streamSimple> {
+  const originalResult = stream.result.bind(stream);
+  stream.result = async () => {
+    const message = await originalResult();
+    if (!message || typeof message !== "object") {
+      return message;
+    }
+    const msg = message as unknown as Record<string, unknown>;
+    const content = msg.content;
+    if (!Array.isArray(content)) {
+      return message;
+    }
+
+    // Find text blocks that may contain XML tool calls
+    const newContent: unknown[] = [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") {
+        newContent.push(block);
+        continue;
+      }
+      const typedBlock = block as Record<string, unknown>;
+      if (typedBlock.type !== "text" || typeof typedBlock.text !== "string") {
+        newContent.push(block);
+        continue;
+      }
+
+      const text = typedBlock.text;
+      if (!containsKimiCodingXmlToolCalls(text)) {
+        newContent.push(block);
+        continue;
+      }
+
+      // Parse XML tool calls
+      const { toolCalls, remainingText } = parseKimiCodingXmlToolCalls(text);
+
+      // Add remaining text if any
+      if (remainingText) {
+        newContent.push({ type: "text", text: remainingText });
+      }
+
+      // Add tool calls as structured blocks
+      for (const toolCall of toolCalls) {
+        newContent.push({
+          type: "toolCall",
+          toolCallId: `kimi_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+          name: toolCall.name,
+          arguments: toolCall.parameters,
+        });
+      }
+    }
+
+    msg.content = newContent;
+    return message;
+  };
+
+  const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
+  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
+    function () {
+      const iterator = originalAsyncIterator();
+
+      return {
+        async next() {
+          const result = await iterator.next();
+          if (result.done || !result.value || typeof result.value !== "object") {
+            return result;
+          }
+
+          const event = result.value as { partial?: unknown; message?: unknown };
+
+          // Check message event for XML tool calls
+          if (event.message && typeof event.message === "object") {
+            const msgEvent = event.message as Record<string, unknown>;
+            const msgContent = msgEvent.content;
+            if (Array.isArray(msgContent)) {
+              const newContent: unknown[] = [];
+              for (const block of msgContent) {
+                if (!block || typeof block !== "object") {
+                  newContent.push(block);
+                  continue;
+                }
+                const typedBlock = block as Record<string, unknown>;
+                if (typedBlock.type !== "text" || typeof typedBlock.text !== "string") {
+                  newContent.push(block);
+                  continue;
+                }
+
+                const text = typedBlock.text;
+                if (!containsKimiCodingXmlToolCalls(text)) {
+                  newContent.push(block);
+                  continue;
+                }
+
+                const { toolCalls, remainingText } = parseKimiCodingXmlToolCalls(text);
+                if (remainingText) {
+                  newContent.push({ type: "text", text: remainingText });
+                }
+                for (const toolCall of toolCalls) {
+                  newContent.push({
+                    type: "toolCall",
+                    toolCallId: `kimi_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
+                    name: toolCall.name,
+                    arguments: toolCall.parameters,
+                  });
+                }
+              }
+              msgEvent.content = newContent;
+            }
+          }
+
+          return result;
+        },
+        async return(value?: unknown) {
+          return iterator.return?.(value) ?? { done: true as const, value: undefined };
+        },
+        async throw(error?: unknown) {
+          return iterator.throw?.(error) ?? { done: true as const, value: undefined };
+        },
+      };
+    };
+  return stream;
+}
+
+function wrapStreamFnKimiCodingXmlTools(baseFn: StreamFn): StreamFn {
+  return (model, context, options) => {
+    // Only apply to Kimi Coding models
+    if (!isKimiCodingModel(model)) {
+      return baseFn(model, context, options);
+    }
+    const maybeStream = baseFn(model, context, options);
+    if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+      return Promise.resolve(maybeStream).then((stream) =>
+        wrapStreamParseKimiCodingXmlTools(stream),
+      );
+    }
+    return wrapStreamParseKimiCodingXmlTools(maybeStream);
   };
 }
 
@@ -1372,6 +1531,10 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn,
         allowedToolNames,
       );
+
+      // Kimi Coding returns tool calls as XML instead of structured JSON.
+      // Parse XML tool calls before they reach the tool dispatch layer.
+      activeSession.agent.streamFn = wrapStreamFnKimiCodingXmlTools(activeSession.agent.streamFn);
 
       if (isXaiProvider(params.provider, params.modelId)) {
         activeSession.agent.streamFn = wrapStreamFnDecodeXaiToolCallArguments(

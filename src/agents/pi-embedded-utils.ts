@@ -425,3 +425,90 @@ export function inferToolMetaFromArgs(toolName: string, args: unknown): string |
   const display = resolveToolDisplay({ name: toolName, args });
   return formatToolDetail(display);
 }
+
+// ============================================================================
+// Kimi Coding XML Tool Call Parsing
+// ============================================================================
+
+export type ParsedXmlToolCall = {
+  name: string;
+  parameters: Record<string, unknown>;
+};
+
+/**
+ * Parse XML tool calls from Kimi Coding's anthropic-messages endpoint.
+ * Kimi Coding returns tool calls as XML instead of structured JSON:
+ * <invoke name="exec">
+ * <parameter name="command">echo "Hello"</parameter>
+ * </invoke>
+ */
+export function parseKimiCodingXmlToolCalls(text: string): {
+  toolCalls: ParsedXmlToolCall[];
+  remainingText: string;
+} {
+  if (!text || !text.includes("<invoke")) {
+    return { toolCalls: [], remainingText: text };
+  }
+
+  const toolCalls: ParsedXmlToolCall[] = [];
+  let remainingText = text;
+
+  // Match <invoke name="...">...</invoke> blocks
+  const invokeRe = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/gi;
+  let match: RegExpExecArray | null;
+
+  // eslint-disable-next-line no-cond-assign
+  while ((match = invokeRe.exec(text)) !== null) {
+    const toolName = match[1]?.trim();
+    const innerXml = match[2] ?? "";
+
+    if (!toolName) {
+      continue;
+    }
+
+    // Parse <parameter name="...">value</parameter> blocks
+    const parameters: Record<string, unknown> = {};
+    const paramRe = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/gi;
+    let paramMatch: RegExpExecArray | null;
+
+    // eslint-disable-next-line no-cond-assign
+    while ((paramMatch = paramRe.exec(innerXml)) !== null) {
+      const paramName = paramMatch[1]?.trim();
+      const paramValue = paramMatch[2]?.trim() ?? "";
+
+      if (paramName) {
+        // Try to parse as JSON, otherwise use as string
+        try {
+          parameters[paramName] = JSON.parse(paramValue);
+        } catch {
+          parameters[paramName] = paramValue;
+        }
+      }
+    }
+
+    toolCalls.push({ name: toolName, parameters });
+
+    // Remove this invoke block from remaining text
+    remainingText = remainingText.replace(match[0], "");
+  }
+
+  // Clean up remaining text
+  remainingText = remainingText
+    .replace(/<invoke[^>]*>[\s\S]*?<\/invoke>/gi, "")
+    .replace(/<parameter[^>]*>[\s\S]*?<\/parameter>/gi, "")
+    .replace(/<kimi:tool_call>/gi, "")
+    .replace(/<\/kimi:tool_call>/gi, "")
+    .trim();
+
+  return { toolCalls, remainingText };
+}
+
+/**
+ * Check if text contains Kimi Coding XML tool calls
+ */
+export function containsKimiCodingXmlToolCalls(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  return /<invoke\s+name=/i.test(text) && /<parameter\s+name=/i.test(text);
+}
